@@ -1,0 +1,32 @@
+# serial_ModbusRTU_slavery 参数配置
+# 串口: /dev/ttyTHS1 9600 8N1（cs8 -parenb -cstopb -crtscts）
+serial_ModbusRTU_slavery_node:
+  ros__parameters:
+    serial_device: "/dev/ttyTHS1"
+    baudrate: 9600
+    parity: "N"
+    data_bits: 8
+    stop_bits: 1
+    rs485_mode: false
+
+    # 可配置从站数量与 ID（slavery 数量可配置，分配不同 id 通信）
+    slave_ids: [1]
+    # true: LED 指令广播到所有从站; false: 仅发给与 msg.id 匹配的从站
+    send_to_all_slaves: false
+
+    # cycle task 周期 100ms
+    cycle_period_ms: 100
+    # 单次等待从站应答超时
+    response_timeout_ms: 10
+    # 最大连续重试次数（超过后默认掉站，不再读写该从站）
+    max_retries: 3
+    # 每 N 个周期下发一次配置信息帧（需求4: 01 06 00 04 01 02 ...），0=禁用
+    config_period_cycles: 0
+    # 每 N 个周期对掉站设备做一次恢复探测，0=禁用（严格按"掉站后不再读写"）
+    offline_probe_cycles: 10
+
+    # 配置信息模式: 01（呼吸）; 时间系数: 02
+    led_info_mode: 1
+    led_time_coefficient: 2
+
+    debug: false
