@@ -1,9 +1,9 @@
-#include "serial_ModbusRTU_slavery/led_protocol.hpp"
+#include "serial_modbus_rtu_slavery/led_protocol.hpp"
 
 #include <iomanip>
 #include <sstream>
 
-namespace serial_ModbusRTU_slavery
+namespace serial_modbus_rtu_slavery
 {
 
 uint16_t modbus_crc16(const uint8_t* data, size_t len)
@@ -25,32 +25,25 @@ uint16_t modbus_crc16(const uint8_t* data, size_t len)
 
 std::optional<ModbusWriteRequest> make_led_request(int16_t runmode, int16_t color)
 {
-    ModbusWriteRequest req;
-    req.function = kFuncWriteCoil;
-
-    // 关闭显示：向 0x0004 线圈写 0（01 05 00 04 00 00 ...）
-    if (runmode == LED_RUNMODE_STOP)
-    {
-        req.address = kLedAddrOff;
-        req.value   = kCoilValueOff;
-        return req;
-    }
+    // 新协议：功能码 0x06 写单寄存器，固定写寄存器地址 2199
+    if (color < LED_COLOR_RED || color > LED_COLOR_YELLOW)
+        return std::nullopt; // 新协议仅支持 红/绿/蓝/黄 四种颜色
 
     uint16_t base = 0;
     switch (runmode)
     {
-        case LED_RUNMODE_CONSTANT: base = kLedBaseConstant; break;
-        case LED_RUNMODE_BREATH:   base = kLedBaseBreath;   break;
-        case LED_RUNMODE_BLINK:    base = kLedBaseBlink;    break;
+        case LED_RUNMODE_CONSTANT: base = kLedValueBaseConstant; break; // 常亮 2010~2013
+        case LED_RUNMODE_BREATH:   base = kLedValueBaseBreath;   break; // 呼吸 2020~2023
+        case LED_RUNMODE_BLINK:    base = kLedValueBaseBlink;    break; // 闪烁 2030~2033
         default:
-            return std::nullopt; // 非法 runmode
+            return std::nullopt; // runmode 仅支持 常亮/呼吸/闪烁
     }
 
-    if (color < LED_COLOR_RED || color > LED_COLOR_WARM_WHITE)
-        return std::nullopt; // 非法 color
-
-    req.address = static_cast<uint16_t>(base + static_cast<uint16_t>(color - 1));
-    req.value   = kCoilValueOn;
+    ModbusWriteRequest req;
+    req.function = kFuncWriteRegister;
+    req.address  = kLedRegAddr;
+    req.value    = static_cast<uint16_t>(base + static_cast<uint16_t>(color - LED_COLOR_RED));
+    req.role     = FrameRole::LedCommand;
     return req;
 }
 
@@ -60,6 +53,7 @@ ModbusWriteRequest make_config_request(uint16_t info_mode, uint16_t time_coeffic
     req.function = kFuncWriteRegister;
     req.address  = kConfigRegAddr;
     req.value    = static_cast<uint16_t>(((info_mode & 0xFF) << 8) | (time_coefficient & 0xFF));
+    req.role     = FrameRole::ConfigFrame;
     return req;
 }
 
@@ -93,4 +87,4 @@ std::string frame_to_hex_string(const ModbusWriteRequest& req)
     return oss.str();
 }
 
-} // namespace serial_ModbusRTU_slavery
+} // namespace serial_modbus_rtu_slavery

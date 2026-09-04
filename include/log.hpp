@@ -20,7 +20,7 @@
 #define LOG_File_SIZE (20* 10240) // 20 KB
 
 #ifndef PROJECT_NAME
-    #define PROJECT_NAME "serial_ModbusRTU_slavery"
+    #define PROJECT_NAME "serial_modbus_rtu_slavery"
 #endif
 
 using namespace std;
@@ -36,7 +36,7 @@ class myLogger
     
         std::string package_name = PROJECT_NAME ;
         std::string pkg_prefix = ament_index_cpp::get_package_prefix(package_name);
-        std::string log_path = pkg_prefix + "/log/";
+        std::string log_path = pkg_prefix + "/log/"+package_name+"/log/";
         std::string log_file_full_path = log_path + LOG_NAME;
 
         bool file_exists(const std::string& path) 

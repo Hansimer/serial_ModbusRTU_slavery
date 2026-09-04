@@ -1,18 +1,12 @@
-#include "serial_ModbusRTU_slavery/modbus_master.hpp"
+#include "serial_modbus_rtu_slavery/modbus_master.hpp"
 
 #include <cerrno>
 #include <cstring>
 
 #include "../include/log.hpp"
 
-namespace serial_ModbusRTU_slavery
+namespace serial_modbus_rtu_slavery
 {
-
-namespace
-{
-/// 队列长度上限（防止指令积压导致总线拥堵）
-constexpr size_t kMaxQueueSize = 16;
-} // namespace
 
 ModbusMaster::ModbusMaster(const ModbusMasterConfig& cfg)
   : cfg_(cfg)
@@ -71,7 +65,7 @@ bool ModbusMaster::init()
     }
 
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
+        std::lock_guard<std::mutex> lock(state_mutex_);
         for (const int id : cfg_.slave_ids)
         {
             if (id < 1 || id > 247)
@@ -122,28 +116,23 @@ void ModbusMaster::push_led_command(int16_t runmode, int16_t color, int8_t src_i
         return;
     }
 
-    std::lock_guard<std::mutex> lock(queue_mutex_);
+    std::lock_guard<std::mutex> lock(state_mutex_);
     for (auto& s : slaves_)
     {
-        // 是否将指令发送到该从站
+        // 是否将指令下发到该从站
         if (!cfg_.send_to_all_slaves && s.id != static_cast<int>(src_id))
             continue;
 
-        ModbusWriteRequest req = *led;
-        req.slave_id = static_cast<uint8_t>(s.id);
-
-        // 去重：与在途帧或队尾帧相同则不入队（避免重复刷总线）
-        if (s.in_flight && *s.in_flight == req)
-            continue;
-        if (!s.tx_queue.empty() && s.tx_queue.back() == req)
-            continue;
-
-        // 无论在线/掉站都记录"期望状态"，供掉站恢复探测使用
-        s.last_desired = req;
-
-        if (s.tx_queue.size() >= kMaxQueueSize)
-            s.tx_queue.pop_front(); // 队列积压保护：丢弃最旧指令，保留最新
-        s.tx_queue.push_back(req);
+        // 期望指令值发生变化：标记待同步，cycle_task 会读取寄存器 1002 比对，
+        // 一致则不再 0x06 写入，不同则写入新指令
+        if (!s.has_desired || s.desired_value != led->value)
+        {
+            LOG_INFO("slave[%d] new desired led cmd value=%u (runmode=%d color=%d)",
+                     s.id, led->value, static_cast<int>(runmode), static_cast<int>(color));
+            s.has_desired = true;
+            s.desired_value = led->value;
+            s.desired_changed = true; // 强制下个周期立即比对并（如有需要）写入
+        }
     }
 }
 
@@ -160,7 +149,7 @@ void ModbusMaster::cycle_task()
 
         if (!slaves_.empty())
         {
-            // 单周期时间预算（9/10 周期），避免超时/重试拖垮 100ms 周期
+            // 单周期时间预算（9/10 周期），避免读/写超时拖垮 100ms 周期
             const auto budget = period * 9 / 10;
             for (size_t k = 0; k < slaves_.size(); ++k)
             {
@@ -169,12 +158,12 @@ void ModbusMaster::cycle_task()
                     std::chrono::steady_clock::now() - cycle_start);
                 if (spent >= budget)
                     break;
-                process_slave(idx); // 内部仅在取帧/回写状态时短锁，串口发送在外
+                process_slave(idx); // 内部仅在读写状态时短锁，串口发送在锁外
             }
             round_robin_index_ = (round_robin_index_ + 1) % slaves_.size();
         }
 
-        // 补偿休眠到下一个周期边界，保持 100ms 节拍
+        // 补偿休眠到下一个周期边界，保持稳定节拍
         const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - cycle_start);
         if (spent < period)
@@ -186,97 +175,188 @@ void ModbusMaster::cycle_task()
 
 void ModbusMaster::process_slave(size_t idx)
 {
-    std::optional<ModbusWriteRequest> job;
-    bool is_probe = false;
-
-    // ---- 第1步：在锁内取一个待发送的帧 ----
+    // ---- 第0步（锁内）：掉站设备的恢复探测判定 ----
+    bool probe = false;
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        SlaveState& s = slaves_[idx];
-
-        // 掉站设备：不进行正常读写，仅按周期做一次恢复探测
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        const SlaveState& s = slaves_[idx];
         if (!s.online)
         {
-            if (cfg_.offline_probe_cycles > 0 && (cycle_count_.load() % cfg_.offline_probe_cycles) == 0)
-            {
-                if (s.last_desired)
-                    job = *s.last_desired;
-                else
-                {
-                    job = make_config_request(cfg_.led_info_mode, cfg_.led_time_coefficient);
-                    job->slave_id = static_cast<uint8_t>(s.id);
-                }
-                is_probe = true;
-            }
-            if (!job)
-                return;
-        }
-        else
-        {
-            // 在途帧失败 -> 下一周期重试同一帧
-            if (s.in_flight)
-            {
-                job = *s.in_flight;
-            }
-            else if (!s.tx_queue.empty())
-            {
-                job = s.tx_queue.front();
-                s.tx_queue.pop_front();
-                s.in_flight = *job;
-            }
-            else if (cfg_.config_period_cycles > 0)
-            {
-                // 队列空时周期下发配置信息帧（需求4）
-                ++s.cycles_since_config;
-                if (!s.config_sent_once || s.cycles_since_config >= cfg_.config_period_cycles)
-                {
-                    job = make_config_request(cfg_.led_info_mode, cfg_.led_time_coefficient);
-                    job->slave_id = static_cast<uint8_t>(s.id);
-                }
-            }
-            if (!job)
+            if (cfg_.offline_probe_cycles > 0 &&
+                cycle_count_.load() % cfg_.offline_probe_cycles == 0)
+                probe = true; // 仅做 0x03 读探测（比写更安全）
+            else
                 return;
         }
     }
 
-    // ---- 第2步：在锁外发送（串口公共资源，内部 serial_mutex_ 互斥）----
-    const bool ok = try_send(*job);
-
-    // ---- 第3步：在锁内根据应答结果更新状态 ----
+    if (probe)
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
+        uint16_t st = 0;
+        if (read_status(idx, st))
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            SlaveState& s = slaves_[idx];
+            s.status_valid = true;
+            s.last_status = st;
+            mark_online(s);
+        }
+        return;
+    }
+
+    // ---- 第1步（锁外串口）：功能码 0x03 读取寄存器 1002（当前正在执行的指令）----
+    uint16_t status = 0;
+    const bool read_ok = read_status(idx, status);
+
+    bool do_write = false;   // 是否需要 0x06 写新指令
+    bool config_due = false; // 周期配置信息帧到期（需求4，仅参数开启时）
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
         SlaveState& s = slaves_[idx];
 
-        if (is_probe)
-        {
-            if (ok)
-                mark_online(s);
-            return;
-        }
-
-        if (ok) // 应答核对通过（libmodbus 已完成 CRC 与回显校验）
-        {
-            if (job->function == kFuncWriteCoil)
-                s.in_flight.reset();
-            else // 配置帧
-            {
-                s.config_sent_once = true;
-                s.cycles_since_config = 0;
-            }
-            s.last_desired = *job;
-            s.consecutive_failures = 0;
-        }
-        else // 超时/校验失败 -> 累计重试，达到上限后默认掉站
+        if (!read_ok)
         {
             ++s.consecutive_failures;
             if (s.consecutive_failures >= cfg_.max_retries)
-            {
-                if (job->function == kFuncWriteCoil)
-                    s.in_flight.reset(); // 丢弃该帧，停止对该从站的读写
+                mark_offline(s); // 连续读失败达到上限 -> 掉站
+            return;
+        }
+        s.consecutive_failures = 0;
+        s.status_valid = true;
+        s.last_status = status;
+
+        // ---- 第2步：比对：一致则不进行 0x06 写入；不同则写新指令 ----
+        if (!s.has_desired || s.desired_value == s.last_status)
+        {
+            // 无指令需求，或 1002 已等于期望指令 -> 无需写入
+            s.desired_changed = false;
+        }
+        else
+        {
+            // 1002 != 期望指令：需要下发。期望值刚更新则立即写；
+            // 否则按 max_retries 周期冷却重试，避免从站已应答但迟迟未执行时每周期刷写总线
+            const int cur = cycle_count_.load();
+            const bool cooldown_ok = s.last_write_cycle < 0 ||
+                (cur - s.last_write_cycle) >= cfg_.max_retries;
+            do_write = s.desired_changed || cooldown_ok;
+        }
+
+        // 需求4 周期配置帧：仅当本周期无需写 LED 指令且参数开启时下发
+        // if (!do_write && cfg_.config_period_cycles > 0)
+        // {
+        //     ++s.cycles_since_config;
+        //     if (!s.config_sent_once || s.cycles_since_config >= cfg_.config_period_cycles)
+        //         config_due = true;
+        // }
+    }
+
+    if (do_write)
+    {
+        // ---- 第3步（锁外串口）：功能码 0x06 写寄存器 2199 = 新指令 ----
+        uint16_t desired = 0;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            desired = slaves_[idx].desired_value;
+        }
+        const bool wok = write_led_value(idx, desired);
+
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        SlaveState& s = slaves_[idx];
+        if (wok)
+        {
+            s.consecutive_failures = 0;
+            s.last_write_cycle = cycle_count_.load();
+            s.desired_changed = false; // 已下发，等待下轮 1002 读回确认同步
+        }
+        else
+        {
+            ++s.consecutive_failures;
+            if (s.consecutive_failures >= cfg_.max_retries)
                 mark_offline(s);
-            }
         }
     }
+    else if (config_due)
+    {
+        ModbusWriteRequest req = make_config_request(cfg_.led_info_mode, cfg_.led_time_coefficient);
+        req.slave_id = static_cast<uint8_t>(slaves_[idx].id);
+        const bool cok = try_send(req);
+
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        SlaveState& s = slaves_[idx];
+        if (cok)
+        {
+            s.config_sent_once = true;
+            s.cycles_since_config = 0;
+            s.consecutive_failures = 0;
+        }
+        else
+        {
+            ++s.consecutive_failures;
+            if (s.consecutive_failures >= cfg_.max_retries)
+                mark_offline(s);
+        }
+    }
+}
+
+void ModbusMaster::throttle_frame_interval()
+{
+    const auto delay = cfg_.frame_interval;
+    if (delay <= delay.zero())
+        return; // 配置为 0 时表示不限制帧间隔
+
+    // 距上一帧结束的时间不足 delay 时，休眠补齐，确保相邻两帧间隔 >= delay
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = now - last_frame_end_;
+    if (elapsed < delay)
+        std::this_thread::sleep_for(delay - elapsed);
+}
+
+bool ModbusMaster::read_status(size_t idx, uint16_t& value)
+{
+    // tty 为公共资源：所有串口收发必须经此互斥，防止并发写
+    std::lock_guard<std::mutex> lock(serial_mutex_);
+    if (!ctx_)
+        return false;
+
+    const int slave_id = slaves_[idx].id; // 从站 id 注册后不再变化
+    if (modbus_set_slave(ctx_, slave_id) == -1)
+    {
+        LOG_WARN("slave[%d] modbus_set_slave failed", slave_id);
+        return false;
+    }
+
+    modbus_flush(ctx_); // 清空残留字节，避免污染本次应答核对
+
+    // 发送前确保与上一帧间隔 >= cfg_.frame_interval（默认 4ms）
+    throttle_frame_interval();
+
+    uint16_t reg = 0;
+    // 功能码 0x03 读保持寄存器 1002（1 个寄存器）
+    const int rc = modbus_read_registers(ctx_, kLedStatusRegAddr, 1, &reg);
+
+    // 帧事务结束（收到应答或超时），记录为下一帧间隔的起点
+    last_frame_end_ = std::chrono::steady_clock::now();
+
+    if (rc == 1) // 成功返回读取的寄存器个数
+    {
+        value = reg;
+        LOG_INFO("slave[%d] RX reg%d = %u", slave_id, kLedStatusRegAddr, reg);
+        return true;
+    }
+
+    LOG_WARN("slave[%d] RX reg%d FAIL(%s)", slave_id, kLedStatusRegAddr, modbus_strerror(errno));
+    return false;
+}
+
+bool ModbusMaster::write_led_value(size_t idx, uint16_t value)
+{
+    ModbusWriteRequest req;
+    req.slave_id = static_cast<uint8_t>(slaves_[idx].id); // 从站 id 注册后不再变化
+    req.function = kFuncWriteRegister;
+    req.address  = kLedRegAddr;
+    req.value    = value;
+    req.role     = FrameRole::LedCommand;
+    return try_send(req);
 }
 
 bool ModbusMaster::try_send(const ModbusWriteRequest& req)
@@ -296,13 +376,17 @@ bool ModbusMaster::try_send(const ModbusWriteRequest& req)
 
     const std::string hex = frame_to_hex_string(req);
     int rc = -1;
-    if (req.function == kFuncWriteCoil)
+    if (req.function == kFuncWriteCoil || req.function == kFuncWriteRegister)
     {
-        rc = modbus_write_bit(ctx_, req.address, (req.value == kCoilValueOn) ? 1 : 0);
-    }
-    else if (req.function == kFuncWriteRegister)
-    {
-        rc = modbus_write_register(ctx_, req.address, req.value);
+        // 发送前确保与上一帧间隔 >= cfg_.frame_interval（默认 4ms）
+        throttle_frame_interval();
+        if (req.function == kFuncWriteCoil)
+            rc = modbus_write_bit(ctx_, req.address, (req.value == kCoilValueOn) ? 1 : 0);
+        else
+            rc = modbus_write_register(ctx_, req.address, req.value);
+
+        // 帧事务结束（收到应答/回显或超时），记录为下一帧间隔的起点
+        last_frame_end_ = std::chrono::steady_clock::now();
     }
     else
     {
@@ -341,8 +425,6 @@ void ModbusMaster::mark_offline(SlaveState& s)
                  s.id, cfg_.max_retries);
     }
     s.online = false;
-    s.in_flight.reset();
 }
 
-} // namespace serial_ModbusRTU_slavery
-
+} // namespace serial_modbus_rtu_slavery

@@ -1,4 +1,4 @@
-#include "serial_ModbusRTU_slavery/serial_ModbusRTU_slavery_node.hpp"
+#include "serial_modbus_rtu_slavery/serial_modbus_rtu_slavery_node.hpp"
 
 #include <cctype>
 #include <memory>
@@ -7,20 +7,20 @@
 
 #include "../include/log.hpp"
 
-namespace serial_ModbusRTU_slavery
+namespace serial_modbus_rtu_slavery
 {
 
-serial_ModbusRTU_slavery_node::serial_ModbusRTU_slavery_node()
-    : Node("serial_ModbusRTU_slavery_node")
+serial_modbus_rtu_slavery_node::serial_modbus_rtu_slavery_node()
+    : Node("serial_modbus_rtu_slavery_node")
 {
 }
 
-serial_ModbusRTU_slavery_node::~serial_ModbusRTU_slavery_node()
+serial_modbus_rtu_slavery_node::~serial_modbus_rtu_slavery_node()
 {
     stop();
 }
 
-bool serial_ModbusRTU_slavery_node::init()
+bool serial_modbus_rtu_slavery_node::init()
 {
     // ===================== 声明并读取 ROS 参数 =====================
     declare_parameter("serial_device", "/dev/ttyTHS1");
@@ -32,6 +32,7 @@ bool serial_ModbusRTU_slavery_node::init()
     declare_parameter("slave_ids", std::vector<int64_t>{1});
     declare_parameter("cycle_period_ms", 100);
     declare_parameter("response_timeout_ms", 100);
+    declare_parameter("frame_interval_ms", 4);
     declare_parameter("max_retries", 3);
     declare_parameter("config_period_cycles", 20);
     declare_parameter("offline_probe_cycles", 100);
@@ -53,6 +54,7 @@ bool serial_ModbusRTU_slavery_node::init()
 
     cfg_.cycle_period         = std::chrono::milliseconds(get_parameter("cycle_period_ms").as_int());
     cfg_.response_timeout     = std::chrono::milliseconds(get_parameter("response_timeout_ms").as_int());
+    cfg_.frame_interval       = std::chrono::milliseconds(get_parameter("frame_interval_ms").as_int());
     cfg_.max_retries          = static_cast<int>(get_parameter("max_retries").as_int());
     cfg_.config_period_cycles = static_cast<int>(get_parameter("config_period_cycles").as_int());
     cfg_.offline_probe_cycles = static_cast<int>(get_parameter("offline_probe_cycles").as_int());
@@ -71,11 +73,12 @@ bool serial_ModbusRTU_slavery_node::init()
         cfg_.slave_ids.push_back(1); // 未配置任何从站 ID 时回退为默认 1 号从站
 
     LOG_INFO("params: dev=%s baud=%d parity=%c data=%d stop=%d rs485=%d slaves=%zu "
-             "cycle=%lldms timeout=%lldms retry=%d",
+             "cycle=%lldms timeout=%lldms frame_interval=%lldms retry=%d",
              cfg_.serial_device.c_str(), cfg_.baudrate, cfg_.parity, cfg_.data_bits,
              cfg_.stop_bits, cfg_.rs485_mode ? 1 : 0, cfg_.slave_ids.size(),
              static_cast<long long>(cfg_.cycle_period.count()),
              static_cast<long long>(cfg_.response_timeout.count()),
+             static_cast<long long>(cfg_.frame_interval.count()),
              cfg_.max_retries);
 
     // ===================== 初始化 Modbus 主站（打开串口）=====================
@@ -95,23 +98,30 @@ bool serial_ModbusRTU_slavery_node::init()
             led_state_callback(msg);
         });
 
+
+
     LOG_INFO("subscribed /led_state/torso (my_interfaces::msg::MsgInfoLedCmd)");
-    return true;
+    return true; 
 }
 
-void serial_ModbusRTU_slavery_node::start()
+void serial_modbus_rtu_slavery_node::start()
 {
+    // my_interfaces::msg::MsgInfoLedCmd::SharedPtr test_msg;
+    // test_msg->color =1;
+    // test_msg->id =1;
+    // test_msg->runmode =1;
+    // led_state_callback(test_msg);
     if (master_)
         master_->start();
 }
 
-void serial_ModbusRTU_slavery_node::stop()
+void serial_modbus_rtu_slavery_node::stop()
 {
     if (master_)
         master_->stop();
 }
 
-void serial_ModbusRTU_slavery_node::led_state_callback(
+void serial_modbus_rtu_slavery_node::led_state_callback(
     const my_interfaces::msg::MsgInfoLedCmd::SharedPtr msg)
 {
     // 解析 runmode/color，由 ModbusMaster 组成数据帧并入队（cycle task 集中发送）
@@ -119,16 +129,16 @@ void serial_ModbusRTU_slavery_node::led_state_callback(
         master_->push_led_command(msg->runmode, msg->color, msg->id);
 }
 
-} // namespace serial_ModbusRTU_slavery
+} // namespace serial_modbus_rtu_slavery
 
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
 
-    auto node = std::make_shared<serial_ModbusRTU_slavery::serial_ModbusRTU_slavery_node>();
+    auto node = std::make_shared<serial_modbus_rtu_slavery::serial_modbus_rtu_slavery_node>();
     if (!node->init())
     {
-        RCLCPP_ERROR(node->get_logger(), "serial_ModbusRTU_slavery_node init failed");
+        RCLCPP_ERROR(node->get_logger(), "serial_modbus_rtu_slavery_node init failed");
         rclcpp::shutdown();
         return -1;
     }

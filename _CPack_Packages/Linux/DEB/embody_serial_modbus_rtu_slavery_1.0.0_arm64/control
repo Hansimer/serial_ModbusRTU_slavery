@@ -1,0 +1,10 @@
+Architecture: arm64
+Depends: libc6, libgcc-s1, libpython3.10, libstdc++6, ros-humble-action-msgs, ros-humble-builtin-interfaces, ros-humble-fastcdr, ros-humble-rosidl-default-runtime, ros-humble-sensor-msgs, ros-humble-unique-identifier-msgs
+Description: serial_modbus_rtu_slavery: Modbus RTU slavery for ROS2
+Maintainer: hsm <137196922@qq.com>
+Package: embody_serial_modbus_rtu_slavery
+Priority: optional
+Section: devel
+Version: 1.0.0
+Installed-Size: 11711
+
